@@ -9,9 +9,9 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 import torch.nn.functional as F
 import math
-
+torch.backends.cudnn.benchmark=True
 import utils
-from model import Model, Omniglot_Model, Recon_Omniglot_Model
+from model import Model, ResNet_Generator, Omniglot_Model, Recon_Omniglot_Model
 
 from compute_MI_CondEntro import init_models, information
 
@@ -244,20 +244,22 @@ def omniglot_test(net, memory_data_loader, test_data_loader):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Omniglot Experiments')
-    parser.add_argument('--temperature', default=0.1, type=float, help='Temperature used in softmax\
+    parser.add_argument('--temperature', default=0.5, type=float, help='Temperature used in softmax\
                          (0.1 for omniglot and 0.5 for cifar)')
-    parser.add_argument('--k', default=1, type=int, help='Top k most similar images used to predict the label\
+    parser.add_argument('--k', default=200, type=int, help='Top k most similar images used to predict the label\
                          (1 for omniglot and 200 for cifar)')
-    parser.add_argument('--batch_size', default=482, type=int, help='Number of images in each mini-batch\
+    parser.add_argument('--batch_size', default=512, type=int, help='Number of images in each mini-batch\
                          (964/2=482 for omniglot and 512 for cifar)')
-    parser.add_argument('--epochs', default=1000, type=int, help='Number of sweeps over the dataset to train')
-    parser.add_argument('--resnet_depth', default=18, type=int, help='The depth of the resnet\
+    parser.add_argument('--epochs', default=30000, type=int, help='Number of sweeps over the dataset to train')
+    parser.add_argument('--resnet_depth', default=0, type=int, help='The depth of the resnet\
                          (only for cifar)')
     parser.add_argument('--feature_dim', default=128, type=int, help='Feature dim for latent vector\
                          (only for cifar)')
-    parser.add_argument('--dataset', default='omniglot', type=str, help='omniglot or cifar')
+    parser.add_argument('--gen_size', default=64, type=int, help='Generator hidden size\
+                         (only for cifar)')
+    parser.add_argument('--dataset', default='cifar', type=str, help='omniglot or cifar')
     parser.add_argument('--trial', default=99, type=int, help='number of trial')
-    parser.add_argument('--loss_type', default=1, type=int, help='1: only contrast (NCE),\
+    parser.add_argument('--loss_type', default=12, type=int, help='1: only contrast (NCE),\
                         2: contrast (NCE) + inverse_pred, 3: only forward_pred (BCE),\
                         4: forward_pred (RevBCE) + inverse_pred, 5: contrast (NCE) + forward_pred (RevBCE),\
                         6: contrast (NCE) + forward_pred (RevBCE) + inverse_pred,\
@@ -268,6 +270,10 @@ if __name__ == '__main__':
     parser.add_argument('--inver_param', default=0.001, type=float, help='Hyper_param for inverse_pred')
     parser.add_argument('--recon_param', default=0.001, type=float, help='Hyper_param for forward_pred')
     parser.add_argument('--with_info', default=False, action='store_true')
+    parser.add_argument('--log_dir', default='saves', type=str)
+    parser.add_argument('--name', default='', type=str)
+    parser.add_argument('--trial_name', default='', type=str)
+    parser.add_argument('--all_saves', default='.', type=str)
 
     # args parse
     args = parser.parse_args()
@@ -328,24 +334,11 @@ if __name__ == '__main__':
     # model setup and optimizer config
     if args.dataset == 'cifar':
         model = Model(feature_dim, resnet_depth=resnet_depth).cuda()
-        recon_model = None
+        recon_model = ResNet_Generator(model.resnet_output_dim,args.gen_size).cuda() if args.loss_type >= 3 else None
     else:
         model = Omniglot_Model().cuda()
         recon_model = Recon_Omniglot_Model().cuda() if args.loss_type >= 3 else None
-        
-    if args.dataset == 'cifar':
-        flops, params = profile(model, inputs=(torch.randn(1, 3, 32, 32).cuda(),))
-    else:
-        flops, params = profile(model, inputs=(torch.randn(1, 1, 28, 28).cuda(),))
-        #flops, params = profile(model, inputs=(torch.randn(1, 1, 56, 56).cuda(),))
-        #flops, params = profile(model, inputs=(torch.randn(1, 1, 105, 105).cuda(),))
-        if recon_model is not None:
-            recon_flops, recon_params = profile(recon_model, inputs=(torch.randn(1, 1024).cuda(),))
-    flops, params = clever_format([flops, params])
-    print('# Model Params: {} FLOPs: {}'.format(params, flops))
-    if recon_model is not None:
-        recon_flops, recon_params = clever_format([recon_flops, recon_params])
-        print('# Recon_Model Params: {} FLOPs: {}'.format(recon_params, recon_flops))
+
     optimizer = optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-6)
     recon_optimizer = optim.Adam(recon_model.parameters(), lr=1e-3, weight_decay=1e-6) if recon_model is not None \
                         else None
@@ -364,8 +357,10 @@ if __name__ == '__main__':
                                                           batch_size, epochs)
     else:
         save_name_pre = '{}_{}_{}_{}_{}'.format(args.dataset, args.loss_type, recon_param, inver_param, trial)
-    if not os.path.exists('results'):
-        os.mkdir('results')
+    if not os.path.exists(args.log_dir):
+        os.mkdir(args.log_dir)
+    if not os.path.exists(args.all_saves):
+        os.mkdir(args.all_saves)
     best_acc = 0.0
     for epoch in range(1, epochs + 1):
         if(epoch%4)==1:
@@ -385,16 +380,16 @@ if __name__ == '__main__':
         
         # save statistics
         data_frame = pd.DataFrame(data=results, index=range(1, epoch + 1))
-        data_frame.to_csv('results/{}_statistics.csv'.format(save_name_pre), index_label='epoch')
+        data_frame.to_csv(os.path.join(args.all_saves, 'statistics.csv'), index_label='epoch')
         
         if (epoch%4)==1 and info_dct is not None:
             info_data_frame = pd.DataFrame(data=info_dct['info_results'], index=range(1, epoch + 1, 4))
             if args.loss_type==1:
-                info_data_frame.to_csv('results/Feature_Information.csv', index_label=info_dct['epoch'])
+                info_data_frame.to_csv(os.path.join(args.all_saves, 'Feature_Information.csv'), index_label=info_dct['epoch'])
             elif args.loss_type==2:
-                info_data_frame.to_csv('results/Feature_Information_min_H.csv', index_label=info_dct['epoch'])
+                info_data_frame.to_csv(os.path.join(args.all_saves, 'Feature_Information_min_H.csv'), index_label=info_dct['epoch'])
         
         if args.dataset == 'cifar':
             if test_acc_1 > best_acc:
                 best_acc = test_acc_1
-                torch.save(model.state_dict(), 'results/{}_model.pth'.format(save_name_pre))
+                torch.save(model.state_dict(), os.path.join(args.all_saves, 'model.pth'))

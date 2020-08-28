@@ -2,10 +2,59 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.models.resnet import resnet18, resnet34, resnet50
+from resnet import ResNetm
 
+class ResBlockGenerator(nn.Module):
+
+    def __init__(self, in_channels, out_channels, stride=1):
+        super(ResBlockGenerator, self).__init__()
+
+        self.conv1 = nn.Conv2d(in_channels, out_channels, 3, 1, padding=1)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, 3, 1, padding=1)
+        nn.init.kaiming_uniform_(self.conv1.weight.data, mode='fan_in', nonlinearity='relu')
+        nn.init.kaiming_uniform_(self.conv2.weight.data, mode='fan_in', nonlinearity='relu')
+
+        self.model = nn.Sequential(
+            nn.BatchNorm2d(in_channels),
+            nn.ReLU(),
+            nn.Upsample(scale_factor=2),
+            self.conv1,
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(),
+            self.conv2
+            )
+        self.bypass = nn.Sequential()
+        if stride != 1:
+            self.bypass = nn.Upsample(scale_factor=2)
+
+    def forward(self, x):
+        return self.model(x) + self.bypass(x)
+
+class ResNet_Generator(nn.Module):
+    def __init__(self, z_dim, gen_size):
+        super(ResNet_Generator, self).__init__()
+        self.gen_size = gen_size
+        self.z_dim = z_dim
+
+        self.dense = nn.Linear(self.z_dim, 5 * 5 * gen_size)
+        self.final = nn.Conv2d(gen_size, 3, 3, stride=1, padding=1)
+        nn.init.xavier_uniform(self.dense.weight.data, nn.init.calculate_gain('linear'))
+        nn.init.xavier_uniform(self.final.weight.data, nn.init.calculate_gain('tanh'))
+
+        self.model = nn.Sequential(
+            ResBlockGenerator(gen_size, gen_size, stride=2),
+            ResBlockGenerator(gen_size, gen_size, stride=2),
+            # ResBlockGenerator(gen_size, gen_size, stride=2),
+            nn.BatchNorm2d(gen_size),
+            nn.ReLU(),
+            self.final,
+            nn.Tanh())
+
+    def forward(self, z):
+        return self.model(self.dense(z).view(-1, self.gen_size, 5, 5))
 
 class Model(nn.Module):
-    def __init__(self, feature_dim=128, resnet_depth=18):
+    def __init__(self, feature_dim=128, resnet_depth=0):
         super(Model, self).__init__()
 
         self.f = []
@@ -18,23 +67,33 @@ class Model(nn.Module):
         elif resnet_depth == 50:
             my_resnet = resnet50()
             resnet_output_dim = 2048
+        else:
+            my_resnet = ResNetm()
+            resnet_output_dim = 256
 
-        for name, module in my_resnet.named_children():
-            if name == 'conv1':
-                module = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
-            if not isinstance(module, nn.Linear) and not isinstance(module, nn.MaxPool2d):
-                self.f.append(module)
+        # for name, module in my_resnet.named_children():
+        #     # if name == 'conv1':
+        #         # module = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+        #     if not isinstance(module, nn.Linear) and not isinstance(module, nn.MaxPool2d):
+        #         self.f.append(module)
         # encoder
-        self.f = nn.Sequential(*self.f)
+        self.f = my_resnet# nn.Sequential(*self.f)
         # projection head
-        self.g = nn.Sequential(nn.Linear(resnet_output_dim, 512, bias=False), nn.BatchNorm1d(512),
-                               nn.ReLU(inplace=True), nn.Linear(512, feature_dim, bias=True))
+        self.g = nn.Sequential(nn.Linear(resnet_output_dim, 256, bias=False), nn.BatchNorm1d(256),
+                               nn.ReLU(inplace=True), nn.Linear(256, feature_dim, bias=True))
+        self.resnet_output_dim = resnet_output_dim
 
-    def forward(self, x):
+    def forward(self, x, norm=True):
+        # print(x.shape)
         x = self.f(x)
+        # print(x.shape)
         feature = torch.flatten(x, start_dim=1)
         out = self.g(feature)
-        return F.normalize(feature, dim=-1), F.normalize(out, dim=-1)
+        # return F.normalize(feature, dim=-1), F.normalize(out, dim=-1)
+        if norm:
+            return F.normalize(feature, dim=-1), F.normalize(out, dim=-1)
+        else:
+            return F.normalize(feature, dim=-1), out
 
 
 # for 105x105 size
